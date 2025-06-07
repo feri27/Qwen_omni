@@ -1,0 +1,16 @@
+flask
+flask-socketio
+flask-cors
+transformers @ git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni-preview
+qwen-omni-utils
+flash-attn
+librosa
+numpy
+typing-extensions
+python-socketio
+python-engineio
+eventlet
+aiohttp
+requests
+soundfile
+scipy
