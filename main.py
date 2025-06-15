@@ -1,3 +1,7 @@
+# IMPORTANT: eventlet monkey patch must be FIRST
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, disconnect
 from flask_cors import CORS
@@ -20,6 +24,9 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import functools
+import webrtcvad
+import wave
+from pydub import AudioSegment
 
 # Qwen Omni integration
 class QwenOmniClient:
@@ -33,12 +40,21 @@ class QwenOmniClient:
         """Initialize the Qwen Omni model and processor"""
         try:
             logger.info("Loading Qwen Omni model...")
+            
+            # Load model first
             self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
                 self.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="eager"
+                attn_implementation="eager",
+                local_files_only=True  # Force offline mode
             )
-            self.processor = Qwen2_5OmniProcessor.from_pretrained(self.model_path)
+            
+            # Load processor with offline mode
+            self.processor = Qwen2_5OmniProcessor.from_pretrained(
+                self.model_path,
+                local_files_only=True,  # Force offline mode
+                use_fast=False  # Disable fast tokenizer which might require online access
+            )
             
             # Move model to GPU if available
             if torch.cuda.is_available():
@@ -49,7 +65,42 @@ class QwenOmniClient:
                 
         except Exception as e:
             logger.error(f"Error loading Qwen Omni model: {e}")
-            raise e
+            # Try fallback approach
+            try:
+                logger.info("Trying fallback initialization...")
+                self._initialize_model_fallback()
+            except Exception as fallback_error:
+                logger.error(f"Fallback initialization also failed: {fallback_error}")
+                raise e
+    
+    def _initialize_model_fallback(self):
+        """Fallback initialization method"""
+        # Set offline mode environment variables
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        os.environ['HF_DATASETS_OFFLINE'] = '1'
+        
+        # Load model
+        self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+            self.model_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        
+        # Load processor
+        self.processor = Qwen2_5OmniProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        
+        # Move model to GPU if available
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
+            logger.info("Model loaded on GPU (fallback)")
+        else:
+            logger.info("Model loaded on CPU (fallback)")
     
     def _save_audio_to_temp_file(self, audio_data: bytes) -> str:
         """Save audio bytes to a temporary file and return the path"""
@@ -84,10 +135,10 @@ class QwenOmniClient:
             
             # Create messages for speech-to-text
             messages = [
-                {"role": "system", "content": [{"type": "text", "text": "You are a speech recognition model."}]},
+                {"role": "system", "content": [{"type": "text", "text": "You are a speech recognition model. Transcribe the audio accurately."}]},
                 {"role": "user", "content": [
                     {"type": "audio", "audio": audio},
-                    {"type": "text", "text": "Transcribe the audio into text."},
+                    {"type": "text", "text": "Please transcribe this audio into text."},
                 ]},
             ]
             
@@ -140,15 +191,24 @@ class QwenOmniClient:
         Run inference with the Qwen Omni model
         """
         try:
-            # Apply chat template
-            text = self.processor.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=True
-            )
+            # Apply chat template with error handling
+            try:
+                text = self.processor.apply_chat_template(
+                    messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+            except Exception as template_error:
+                logger.warning(f"Chat template error: {template_error}, using fallback")
+                # Fallback: manually construct the prompt
+                text = self._construct_prompt_manually(messages)
             
             # Process multimedia information
-            audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
+            try:
+                audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
+            except Exception as mm_error:
+                logger.warning(f"MM info processing error: {mm_error}, using simple approach")
+                audios, images, videos = None, None, None
             
             # If we have audio_array, use it instead
             if audio_array is not None:
@@ -162,7 +222,7 @@ class QwenOmniClient:
                 videos=videos, 
                 return_tensors="pt", 
                 padding=True, 
-                use_audio_in_video=True
+                use_audio_in_video=True if audios else False
             )
             
             # Move inputs to model device
@@ -172,13 +232,14 @@ class QwenOmniClient:
             with torch.no_grad():
                 output = self.model.generate(
                     **inputs, 
-                    use_audio_in_video=True, 
+                    use_audio_in_video=True if audios else False, 
                     return_audio=False, 
                     thinker_max_new_tokens=256, 
                     thinker_do_sample=False,
                     max_new_tokens=512,
                     do_sample=True,
-                    temperature=0.7
+                    temperature=0.7,
+                    pad_token_id=self.processor.tokenizer.eos_token_id
                 )
             
             # Decode output
@@ -190,29 +251,66 @@ class QwenOmniClient:
             
             # Extract the response (remove the input part)
             full_response = response[0]
-            # Find the assistant's response part
+            
+            # Try to find the assistant's response part
             if "<|im_start|>assistant\n" in full_response:
                 assistant_response = full_response.split("<|im_start|>assistant\n")[-1]
                 if "<|im_end|>" in assistant_response:
                     assistant_response = assistant_response.split("<|im_end|>")[0]
                 return assistant_response.strip()
+            elif "assistant\n" in full_response:
+                assistant_response = full_response.split("assistant\n")[-1]
+                return assistant_response.strip()
             else:
-                # Fallback: return the last part after the last user message
-                return full_response.split("user\n")[-1].strip()
+                # Fallback: return the generated part after removing input
+                input_text = text
+                if input_text in full_response:
+                    generated_part = full_response.replace(input_text, "").strip()
+                    return generated_part if generated_part else full_response
+                return full_response.strip()
             
         except Exception as e:
             logger.error(f"Error in _run_inference: {e}")
             raise e
+    
+    def _construct_prompt_manually(self, messages: List[Dict]) -> str:
+        """Manually construct prompt when chat template fails"""
+        prompt = ""
+        for message in messages:
+            role = message["role"]
+            content = message["content"]
+            
+            if isinstance(content, list):
+                text_content = ""
+                for item in content:
+                    if item.get("type") == "text":
+                        text_content += item.get("text", "")
+                prompt += f"<|im_start|>{role}\n{text_content}<|im_end|>\n"
+            else:
+                prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        
+        prompt += "<|im_start|>assistant\n"
+        return prompt
+
+# Set offline mode environment variables at startup
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_DATASETS_OFFLINE'] = '1'
 
 # Initialize Flask app
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 
-# Initialize SocketIO with CORS
-socketio = SocketIO(app, cors_allowed_origins="http://localhost:3000", async_mode='threading')
+# Initialize SocketIO with CORS disabled (allow all origins)
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*",  # Allow all origins
+    async_mode='eventlet',  # Use eventlet instead of threading
+    logger=True,
+    engineio_logger=True
+)
 
-# Enable CORS for regular HTTP routes
-CORS(app, origins=["http://localhost:3000"])
+# Enable CORS for regular HTTP routes (allow all origins)
+CORS(app)
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -422,6 +520,51 @@ def process_text_async(client_id, user_text):
             'timestamp': datetime.now().isoformat()
         }, room=manager.active_connections[client_id])
 
+# convert audio formats
+def convert_webm_to_wav(audio_bytes: bytes) -> bytes:
+    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="webm")
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    out_io = io.BytesIO()
+    audio.export(out_io, format="wav")
+    return out_io.getvalue()
+
+def contains_speech(wav_bytes: bytes) -> bool:
+    vad = webrtcvad.Vad(2)  # Aggressiveness: 0–3
+    with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
+        sample_rate = wf.getframerate()
+        frame_duration = 30  # ms
+        frame_size = int(sample_rate * 2 * frame_duration / 1000)
+        frames = wf.readframes(wf.getnframes())
+
+        for i in range(0, len(frames), frame_size):
+            chunk = frames[i:i+frame_size]
+            if len(chunk) < frame_size:
+                break
+            if vad.is_speech(chunk, sample_rate):
+                return True
+    return False
+
+# @socketio.on('audio')
+# def handle_audio(data):
+#     client_id = data.get('client_id')
+#     audio_base64 = data.get('audio')
+    
+#     if not client_id or not manager.is_connected(client_id):
+#         emit('error', {'message': 'Client not connected'})
+#         return
+    
+#     try:
+#         audio_data = process_audio_data(audio_base64)
+#         # Use eventlet spawn for async processing
+#         eventlet.spawn(process_audio_async, client_id, audio_data)
+        
+#     except Exception as e:
+#         logger.error(f"Error handling audio for client {client_id}: {e}")
+#         emit('error', {
+#             'message': f'Error processing audio: {str(e)}',
+#             'timestamp': datetime.now().isoformat()
+#         })
+
 @socketio.on('audio')
 def handle_audio(data):
     client_id = data.get('client_id')
@@ -432,12 +575,15 @@ def handle_audio(data):
         return
     
     try:
-        audio_data = process_audio_data(audio_base64)
-        # Process audio in background thread
-        threading.Thread(
-            target=process_audio_async, 
-            args=(client_id, audio_data)
-        ).start()
+        audio_data = process_audio_data(audio_base64)  # bytes of webm
+        wav_data = convert_webm_to_wav(audio_data)  # convert to WAV
+        
+        if not contains_speech(wav_data):
+            emit('info', {'message': 'Audio contains no speech'})
+            return
+        
+        # Run async processing if speech detected
+        eventlet.spawn(process_audio_async, client_id, audio_data)
         
     except Exception as e:
         logger.error(f"Error handling audio for client {client_id}: {e}")
@@ -445,6 +591,7 @@ def handle_audio(data):
             'message': f'Error processing audio: {str(e)}',
             'timestamp': datetime.now().isoformat()
         })
+
 
 @socketio.on('text')
 def handle_text(data):
@@ -460,11 +607,8 @@ def handle_text(data):
         return
     
     try:
-        # Process text in background thread
-        threading.Thread(
-            target=process_text_async, 
-            args=(client_id, user_text)
-        ).start()
+        # Use eventlet spawn for async processing
+        eventlet.spawn(process_text_async, client_id, user_text)
         
     except Exception as e:
         logger.error(f"Error handling text for client {client_id}: {e}")
@@ -478,11 +622,11 @@ def handle_ping():
     emit('pong')
 
 if __name__ == '__main__':
-    # Run the Flask-SocketIO app
+    # Run the Flask-SocketIO app with eventlet
     socketio.run(
         app, 
         host='0.0.0.0', 
-        port=8000, 
+        port=8010, 
         debug=False,
         use_reloader=False,  # Disable reloader to prevent model loading twice
         log_output=True

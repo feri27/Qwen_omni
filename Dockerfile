@@ -1,38 +1,45 @@
-FROM pytorch/pytorch:2.3.0-cuda11.8-cudnn8-devel
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
-# Install OS dependencies
+# Install OS dependencies & build tools
 RUN apt-get update && apt-get install -y \
     git \
     ffmpeg \
     libsndfile1 \
+    build-essential \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
     curl \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Set workdir
 WORKDIR /app
 
-# Salin requirements.txt
 COPY requirements.txt .
 
-# Upgrade pip dan tools build
+RUN pip install git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni-preview
+
 RUN pip install --upgrade pip setuptools wheel packaging
 
-# Install semua dependencies dari requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
-# Reinstall flash-attn manual agar build lebih stabil
-RUN pip uninstall -y flash-attn && \
-    pip install --no-cache-dir flash-attn --no-build-isolation
+# Install dependencies dari requirements.txt
+RUN pip install -r requirements.txt
 
-# Salin seluruh source code
+# Install flash-attn manual build supaya compatible dengan CUDA
+# RUN pip install flash-attn --no-build-isolation
+
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+
 COPY . .
 
-# Buka port aplikasi
-EXPOSE 8000
+# Salin entrypoint script ke container
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Jalankan aplikasi
-CMD ["python", "main.py"]
+EXPOSE 8010
+
+# Gunakan entrypoint custom
+ENTRYPOINT ["/entrypoint.sh"]
