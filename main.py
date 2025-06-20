@@ -156,7 +156,7 @@ class QwenOmniClient:
         """
         try:
             # Create system message
-            system_prompt = "You are Qwen, a helpful AI assistant created by Alibaba Cloud. You are knowledgeable, helpful, and honest."
+            system_prompt = "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
             
             # Build conversation messages
             messages = [
@@ -233,7 +233,8 @@ class QwenOmniClient:
                 output = self.model.generate(
                     **inputs, 
                     use_audio_in_video=True if audios else False, 
-                    return_audio=False, 
+                    # result audio
+                    return_audio=True, 
                     thinker_max_new_tokens=256, 
                     thinker_do_sample=False,
                     max_new_tokens=512,
